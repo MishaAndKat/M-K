@@ -1,0 +1,28 @@
+// Правила Firestore для нового сайта (Night play).
+// ВАЖНО: добавьте эти блоки к уже существующим правилам, а не заменяйте их —
+// иначе старый сайт перестанет работать. Старые блоки (watchRoom, watchRoomChat,
+// watchRoomPresence) оставьте как есть.
+//
+// Как и у старого сайта, входа для посетителей нет, поэтому доступ открыт
+// только для этих трёх коллекций, а не для всей базы.
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---- Night play (новый чат) ----
+    match /nightPlayRoom/{doc} {
+      allow read, write: if true;
+    }
+    match /nightPlayChat/{doc} {
+      allow read, write: if true;
+    }
+    match /nightPlayPresence/{doc} {
+      allow read, write: if true;
+    }
+
+    // ---- старый сайт: НЕ УДАЛЯТЬ ----
+    // match /watchRoom/{doc} { allow read, write: if true; }
+    // ...и ваши существующие правила для watchRoomChat / watchRoomPresence
+  }
+}

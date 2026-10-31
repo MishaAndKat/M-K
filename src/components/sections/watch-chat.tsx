@@ -1,0 +1,698 @@
+"use client";
+
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import Image from "next/image";
+import { motion, AnimatePresence } from "framer-motion";
+import { Send, Pencil, Trash2, Check, X as XIcon, Reply as ReplyIcon, Download } from "lucide-react";
+import {
+  addDoc,
+  collection,
+  deleteDoc,
+  doc,
+  getDocs,
+  limit,
+  onSnapshot,
+  orderBy,
+  query,
+  serverTimestamp,
+  updateDoc,
+  where,
+  type DocumentData,
+  type QueryDocumentSnapshot,
+  type Timestamp,
+} from "firebase/firestore";
+import { getDb, isFirebaseConfigured } from "@/lib/firebase";
+import { cn } from "@/lib/utils";
+import { withBasePath } from "@/lib/base-path";
+import { CHAT_COLLECTION, getLastRead, markWatchChatRead } from "@/lib/watch-chat";
+import { PresenceBadge } from "@/components/ui/presence-badge";
+
+// A small snapshot of the message being replied to - stored on the reply
+// itself (not just an id) so the quoted preview keeps working even if the
+// original message later gets edited or deleted.
+type ReplySnapshot = {
+  id: string;
+  text: string;
+  who: "a" | "b";
+};
+
+type ChatMessage = {
+  id: string;
+  text: string;
+  who: "a" | "b";
+  createdAt: Timestamp | null;
+  edited?: boolean;
+  replyTo?: ReplySnapshot | null;
+};
+
+// Two separate caps, not one:
+// - LIVE_MESSAGES_LIMIT is what the onSnapshot listener keeps live-synced,
+//   billed as reads on every page load/reconnect - kept small on purpose.
+// - MAX_TOTAL_MESSAGES is how deep you can scroll back in total, live
+//   window plus everything pulled in via "Show earlier messages" below.
+//   Those older batches are one-time getDocs() calls, not listeners, so
+//   they're billed once when actually requested rather than on every load.
+const LIVE_MESSAGES_LIMIT = 40;
+const MAX_TOTAL_MESSAGES = 300;
+const OLDER_BATCH_SIZE = 60;
+
+function formatTime(ts: Timestamp | null): string {
+  if (!ts) return "";
+  const withToDate = ts as unknown as { toDate?: () => Date };
+  const date = typeof withToDate.toDate === "function" ? withToDate.toDate() : new Date(ts as unknown as string);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function mapDoc(d: QueryDocumentSnapshot<DocumentData>): ChatMessage {
+  const data = d.data() as Partial<ChatMessage>;
+  const replyTo = data.replyTo as Partial<ReplySnapshot> | null | undefined;
+  return {
+    id: d.id,
+    text: data.text ?? "",
+    who: data.who === "b" ? "b" : "a",
+    createdAt: (data.createdAt as Timestamp | undefined) ?? null,
+    edited: Boolean(data.edited),
+    replyTo:
+      replyTo && replyTo.id && typeof replyTo.text === "string"
+        ? { id: replyTo.id, text: replyTo.text, who: replyTo.who === "b" ? "b" : "a" }
+        : null,
+  };
+}
+
+// Small round avatar - falls back to an initial-letter circle when no
+// photo is configured, so the layout doesn't depend on both people having
+// uploaded one.
+function Avatar({ name, photo, size = 28 }: { name: string; photo?: string; size?: number }) {
+  if (photo) {
+    return (
+      <span
+        className="relative block shrink-0 overflow-hidden rounded-full ring-1 ring-white/20"
+        style={{ width: size, height: size }}
+      >
+        <Image src={withBasePath(photo)} alt={name} fill sizes={`${size}px`} className="object-cover" />
+      </span>
+    );
+  }
+  return (
+    <span
+      className="grid shrink-0 place-items-center rounded-full bg-thread/20 text-[10px] font-medium text-thread"
+      style={{ width: size, height: size }}
+    >
+      {name.slice(0, 1).toUpperCase()}
+    </span>
+  );
+}
+
+// A dedicated live chat for the watch room - separate from the shared
+// playback state in watch-room.tsx, but rendered alongside it so a film
+// night has somewhere to actually talk. Same Firestore-optional pattern
+// as the rest of the room: fully usable locally if Firebase isn't
+// configured, syncs live between both people once it is.
+export function WatchChat({
+  whoAmI,
+  nameA,
+  nameB,
+  photoA,
+  photoB,
+  variant = "panel",
+  visible = true,
+  onClose,
+  onUnreadChange,
+  partnerOnline = false,
+  partnerLastSeen = null,
+}: {
+  whoAmI: "a" | "b";
+  nameA: string;
+  nameB: string;
+  photoA?: string;
+  photoB?: string;
+  // "panel" - the original fixed-height card, meant to sit in normal page
+  // flow. "overlay" - fills its parent (the video stage) and uses a dark,
+  // translucent surface so it reads well sitting on top of the film.
+  variant?: "panel" | "overlay";
+  // Whether this instance is actually visible to the person right now.
+  // Defaults to true for the "panel" layout (always on-screen when
+  // rendered), but the "overlay" variant in watch-room.tsx now stays
+  // mounted even while closed (see the comment there), so it passes this
+  // explicitly - otherwise a hidden-but-mounted chat would mark every
+  // incoming message "read" instantly and the unread badge would always
+  // show zero.
+  visible?: boolean;
+  // On phones the overlay becomes a full-screen sheet (see watch-room.tsx)
+  // that covers the corner toggle button which normally closes it - so on
+  // that breakpoint we need a close control that lives inside the panel
+  // itself. Only rendered when provided.
+  onClose?: () => void;
+  // Reports the live count of messages from the other person that arrived
+  // after this person's last-read mark, so a parent (e.g. the toggle
+  // button in watch-room.tsx) can badge itself without needing its own
+  // separate Firestore listener on this same collection.
+  onUnreadChange?: (count: number) => void;
+  // The other person's online state, passed down from watch-room.tsx
+  // (which owns the single presence listener) instead of subscribing again here.
+  partnerOnline?: boolean;
+  partnerLastSeen?: string | null;
+}) {
+  const connected = isFirebaseConfigured;
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [draft, setDraft] = useState("");
+  const [sending, setSending] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState("");
+  // The message currently being replied to, if any - shown as a "replying
+  // to..." bar above the input, and attached to the next message sent.
+  const [replyingTo, setReplyingTo] = useState<ChatMessage | null>(null);
+  // Briefly highlighted when a quoted reply preview is tapped, so jumping
+  // to the original message is easy to spot in a long list.
+  const [highlightedId, setHighlightedId] = useState<string | null>(null);
+  const [olderMessages, setOlderMessages] = useState<ChatMessage[]>([]);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [hasMoreOlder, setHasMoreOlder] = useState(true);
+  const listRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const messageRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+
+  const myName = whoAmI === "a" ? nameA : nameB;
+  const otherName = whoAmI === "a" ? nameB : nameA;
+  const myPhoto = whoAmI === "a" ? photoA : photoB;
+  const otherPhoto = whoAmI === "a" ? photoB : photoA;
+
+  useEffect(() => {
+    if (!connected) return;
+    const db = getDb();
+    if (!db) return;
+    setOlderMessages([]);
+    setHasMoreOlder(true);
+    // Sorted newest-first so the cap above keeps the latest conversation;
+    // reversed back to chronological order just for display.
+    const q = query(collection(db, CHAT_COLLECTION), orderBy("createdAt", "desc"), limit(LIVE_MESSAGES_LIMIT));
+    const unsub = onSnapshot(q, (snap) => {
+      setMessages(snap.docs.map(mapDoc).reverse());
+    });
+    return () => unsub();
+  }, [connected]);
+
+  useEffect(() => {
+    const el = listRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+  }, [messages.length]);
+
+  // This component only exists in the DOM while the person is actually
+  // looking at the chat - always-on for the "panel" layout, and only while
+  // the overlay is toggled open in the room. So mounted + new message =
+  // seen; mark it read here rather than waiting for an explicit click.
+  useEffect(() => {
+    if (!visible) return;
+    markWatchChatRead(whoAmI);
+  }, [whoAmI, messages.length, visible]);
+
+  // Live "unread from the other person" count, derived entirely from the
+  // messages this component already has loaded - no separate listener
+  // needed just to keep a badge number up to date. Zero while visible
+  // (nothing to badge, and everything just got marked read above).
+  useEffect(() => {
+    if (!onUnreadChange) return;
+    if (visible) {
+      onUnreadChange(0);
+      return;
+    }
+    const lastRead = getLastRead(whoAmI);
+    let count = 0;
+    for (const m of messages) {
+      if (m.who === whoAmI) continue;
+      const withToMillis = m.createdAt as unknown as { toMillis?: () => number } | null;
+      const ms = withToMillis && typeof withToMillis.toMillis === "function" ? withToMillis.toMillis() : 0;
+      if (ms > lastRead) count++;
+    }
+    onUnreadChange(count);
+  }, [messages, whoAmI, visible, onUnreadChange]);
+
+  const allMessages = useMemo(() => [...olderMessages, ...messages], [olderMessages, messages]);
+
+  async function loadOlderMessages() {
+    if (!connected || loadingOlder || !hasMoreOlder) return;
+    const cursor = olderMessages[0] ?? messages[0];
+    if (!cursor?.createdAt) return;
+    const db = getDb();
+    if (!db) return;
+    const remaining = MAX_TOTAL_MESSAGES - allMessages.length;
+    if (remaining <= 0) {
+      setHasMoreOlder(false);
+      return;
+    }
+    const batchSize = Math.min(OLDER_BATCH_SIZE, remaining);
+    setLoadingOlder(true);
+    const el = listRef.current;
+    const prevScrollHeight = el?.scrollHeight ?? 0;
+    try {
+      const q = query(
+        collection(db, CHAT_COLLECTION),
+        orderBy("createdAt", "desc"),
+        where("createdAt", "<", cursor.createdAt),
+        limit(batchSize)
+      );
+      const snap = await getDocs(q);
+      const fetched = snap.docs.map(mapDoc).reverse();
+      setOlderMessages((prev) => [...fetched, ...prev]);
+      if (snap.docs.length < batchSize) setHasMoreOlder(false);
+    } finally {
+      setLoadingOlder(false);
+      requestAnimationFrame(() => {
+        if (el) el.scrollTop = el.scrollHeight - prevScrollHeight;
+      });
+    }
+  }
+
+  async function handleSend(e: FormEvent) {
+    e.preventDefault();
+    const text = draft.trim();
+    if (!text) return;
+
+    const replySnapshot: ReplySnapshot | null = replyingTo
+      ? { id: replyingTo.id, text: replyingTo.text, who: replyingTo.who }
+      : null;
+
+    if (!connected) {
+      // Local-only preview: message just appears in this browser tab so
+      // the UI is fully explorable before Firebase is configured.
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `local-${Date.now()}`,
+          text,
+          who: whoAmI,
+          createdAt: new Date() as unknown as Timestamp,
+          replyTo: replySnapshot,
+        },
+      ]);
+      setDraft("");
+      cancelReply();
+      return;
+    }
+
+    const db = getDb();
+    if (!db) return;
+    setSending(true);
+    try {
+      await addDoc(collection(db, CHAT_COLLECTION), {
+        text,
+        who: whoAmI,
+        createdAt: serverTimestamp(),
+        replyTo: replySnapshot,
+      });
+      setDraft("");
+      cancelReply();
+    } finally {
+      setSending(false);
+    }
+  }
+
+  function startEdit(m: ChatMessage) {
+    cancelReply();
+    setEditingId(m.id);
+    setEditDraft(m.text);
+  }
+
+  function startReply(m: ChatMessage) {
+    cancelEdit();
+    setReplyingTo(m);
+    inputRef.current?.focus();
+  }
+
+  function cancelReply() {
+    setReplyingTo(null);
+  }
+
+  // Jumps to (and briefly highlights) the original message a reply is
+  // quoting, if it's still loaded in the current window of messages.
+  function scrollToMessage(id: string) {
+    const el = messageRefs.current.get(id);
+    if (!el) return;
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    setHighlightedId(id);
+    setTimeout(() => setHighlightedId((current) => (current === id ? null : current)), 1500);
+  }
+
+  function cancelEdit() {
+    setEditingId(null);
+    setEditDraft("");
+  }
+
+  async function saveEdit(id: string) {
+    const text = editDraft.trim();
+    if (!text) return;
+    if (!connected) {
+      setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, text, edited: true } : m)));
+      cancelEdit();
+      return;
+    }
+    const db = getDb();
+    if (!db) return;
+    await updateDoc(doc(db, CHAT_COLLECTION, id), { text, edited: true });
+    cancelEdit();
+  }
+
+  async function handleDelete(id: string) {
+    if (!connected) {
+      setMessages((prev) => prev.filter((m) => m.id !== id));
+      return;
+    }
+    const db = getDb();
+    if (!db) return;
+    await deleteDoc(doc(db, CHAT_COLLECTION, id));
+  }
+
+  const [exporting, setExporting] = useState(false);
+
+  // Exports the *entire* history, not just what's currently loaded in the
+  // UI (which stays capped at MAX_TOTAL_MESSAGES to keep normal usage
+  // cheap). This is a deliberate, occasional action someone clicks, not
+  // something that runs on every page load, so paying for one full
+  // one-time read here is a reasonable trade - it just shouldn't be the
+  // default behavior of opening the chat.
+  async function handleExportChat() {
+    if (!connected || exporting) return;
+    setExporting(true);
+    try {
+      const db = getDb();
+      if (!db) return;
+      const snap = await getDocs(query(collection(db, CHAT_COLLECTION), orderBy("createdAt", "asc")));
+      const lines = snap.docs.map((d) => {
+        const data = d.data() as Partial<ChatMessage>;
+        const who = data.who === "b" ? nameB : nameA;
+        const ts = data.createdAt as Timestamp | undefined;
+        const date = (ts as unknown as { toDate?: () => Date })?.toDate?.();
+        const stamp = date
+          ? date.toLocaleString("ru-RU", {
+              year: "numeric",
+              month: "2-digit",
+              day: "2-digit",
+              hour: "2-digit",
+              minute: "2-digit",
+            })
+          : "";
+        const edited = data.edited ? " (изменено)" : "";
+        return `[${stamp}] ${who}: ${data.text ?? ""}${edited}`;
+      });
+      const blob = new Blob([lines.join("\n")], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `night-play-chat-${new Date().toISOString().slice(0, 10)}.txt`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  const emptyState = useMemo(() => allMessages.length === 0, [allMessages.length]);
+
+  const overlay = variant === "overlay";
+
+  return (
+    <div
+      className={cn(
+        "flex flex-col overflow-hidden",
+        overlay
+          ? "h-full border-l border-white/10 bg-black/70 backdrop-blur-md"
+          : "card-surface h-[32rem] p-0 lg:h-[70vh] lg:min-h-[560px]"
+      )}
+    >
+      <div
+        className={cn(
+          "flex items-center justify-between gap-2 border-b px-6 py-5",
+          overlay ? "border-white/10" : "border-line dark:border-line-dark"
+        )}
+      >
+        <div className="flex min-w-0 items-center gap-2.5">
+          <Avatar name={otherName} photo={otherPhoto} size={32} />
+          <div className="min-w-0">
+            <p className={cn("eyebrow !text-sm", overlay && "!text-thread")}>Чат</p>
+            <p className={cn("truncate text-xs", overlay ? "text-white/60" : "text-mist")}>
+              {!connected
+                ? `Локальный режим — вы пишете сами себе (${myName})`
+                : `Вы — ${myName} · собеседник: ${otherName}`}
+            </p>
+            {connected && (
+              <PresenceBadge
+                online={partnerOnline}
+                lastSeen={partnerLastSeen}
+                tone={overlay ? "light" : "default"}
+                className={cn("text-[11px]", overlay ? "text-white/60" : "text-mist")}
+              />
+            )}
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          {whoAmI === "a" && connected && (
+            <button
+              onClick={handleExportChat}
+              disabled={exporting}
+              title="Скачать всю переписку текстовым файлом"
+              className={cn(
+                "flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-[11px] font-medium transition-colors disabled:cursor-wait disabled:opacity-60",
+                overlay
+                  ? "border-white/20 text-white/70 hover:border-white/40 hover:text-white"
+                  : "border-line text-mist hover:border-thread/40 hover:text-thread dark:border-line-dark"
+              )}
+            >
+              <Download className="h-3 w-3" />
+              {exporting ? "Сохраняем…" : "Экспорт"}
+            </button>
+          )}
+          {/* Only needed on phones, where this panel becomes a full-screen
+              sheet that covers the corner toggle button in watch-room.tsx -
+              hidden at sm+ where that corner button remains reachable. */}
+          {onClose && (
+            <button
+              onClick={onClose}
+              aria-label="Закрыть чат"
+              className={cn(
+                "grid h-8 w-8 shrink-0 place-items-center rounded-full transition-colors sm:hidden",
+                overlay ? "text-white/70 hover:bg-white/10 hover:text-white" : "text-mist hover:bg-thread/10 hover:text-thread"
+              )}
+            >
+              <XIcon className="h-4 w-4" />
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div ref={listRef} className="flex-1 space-y-3 overflow-y-auto px-5 py-5">
+        {emptyState && (
+          <div className={cn("flex h-full items-center justify-center px-6 text-center text-sm", overlay ? "text-white/50" : "text-mist")}>
+            Сообщений пока нет — напишите что-нибудь, пока грузится фильм.
+          </div>
+        )}
+        {!emptyState && connected && (olderMessages.length > 0 || messages.length >= LIVE_MESSAGES_LIMIT) && hasMoreOlder && (
+          <div className="flex justify-center pb-1">
+            <button
+              onClick={loadOlderMessages}
+              disabled={loadingOlder}
+              className={cn(
+                "rounded-full border px-3 py-1.5 text-[11px] font-medium transition-colors disabled:cursor-wait disabled:opacity-60",
+                overlay
+                  ? "border-white/20 text-white/70 hover:border-white/40 hover:text-white"
+                  : "border-line text-mist hover:border-thread/40 hover:text-thread dark:border-line-dark"
+              )}
+            >
+              {loadingOlder ? "Загрузка…" : "Показать более ранние"}
+            </button>
+          </div>
+        )}
+        <AnimatePresence initial={false}>
+          {allMessages.map((m) => {
+            const mine = m.who === whoAmI;
+            const isEditing = editingId === m.id;
+            const isHighlighted = highlightedId === m.id;
+            const actions = (
+              <span className="mb-1 flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+                <button
+                  onClick={() => startReply(m)}
+                  title="Ответить"
+                  className={cn(
+                    "grid h-6 w-6 place-items-center rounded-full transition-colors",
+                    overlay ? "text-white/50 hover:bg-white/10 hover:text-white" : "text-mist hover:bg-thread/10 hover:text-thread"
+                  )}
+                >
+                  <ReplyIcon className="h-3 w-3" />
+                </button>
+                {mine && (
+                  <>
+                    <button
+                      onClick={() => startEdit(m)}
+                      title="Изменить сообщение"
+                      className={cn(
+                        "grid h-6 w-6 place-items-center rounded-full transition-colors",
+                        overlay ? "text-white/50 hover:bg-white/10 hover:text-white" : "text-mist hover:bg-thread/10 hover:text-thread"
+                      )}
+                    >
+                      <Pencil className="h-3 w-3" />
+                    </button>
+                    <button
+                      onClick={() => handleDelete(m.id)}
+                      title="Удалить сообщение"
+                      className={cn(
+                        "grid h-6 w-6 place-items-center rounded-full transition-colors",
+                        overlay ? "text-white/50 hover:bg-red-500/20 hover:text-red-300" : "text-mist hover:bg-red-500/10 hover:text-red-500"
+                      )}
+                    >
+                      <Trash2 className="h-3 w-3" />
+                    </button>
+                  </>
+                )}
+              </span>
+            );
+            return (
+              <motion.div
+                key={m.id}
+                ref={(el) => {
+                  if (el) messageRefs.current.set(m.id, el);
+                  else messageRefs.current.delete(m.id);
+                }}
+                initial={{ opacity: 0, y: 10 }}
+                animate={{
+                  opacity: 1,
+                  y: 0,
+                  backgroundColor: isHighlighted
+                    ? "rgba(255, 255, 255, 0.12)"
+                    : "rgba(255, 255, 255, 0)",
+                }}
+                exit={{ opacity: 0, y: -4 }}
+                transition={{ backgroundColor: { duration: 0.3 } }}
+                className={cn(
+                  "group flex items-end gap-1.5 rounded-2xl",
+                  mine ? "justify-end" : "justify-start"
+                )}
+              >
+                {!mine && <Avatar name={otherName} photo={otherPhoto} size={22} />}
+
+                {!isEditing && actions}
+
+                <div
+                  className={cn(
+                    "max-w-[80%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed",
+                    mine
+                      ? "rounded-br-sm bg-thread text-void"
+                      : overlay
+                        ? "rounded-bl-sm border border-white/15 bg-white/10 text-white"
+                        : "rounded-bl-sm border border-line bg-white/40 dark:border-line-dark dark:bg-white/[0.04]"
+                  )}
+                >
+                  {isEditing ? (
+                    <div className="flex items-center gap-1.5">
+                      <input
+                        autoFocus
+                        value={editDraft}
+                        onChange={(e) => setEditDraft(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") saveEdit(m.id);
+                          if (e.key === "Escape") cancelEdit();
+                        }}
+                        className="w-full min-w-[10rem] rounded-full border border-white/30 bg-transparent px-3 py-1 text-base text-inherit outline-none sm:text-sm"
+                      />
+                      <button onClick={() => saveEdit(m.id)} title="Сохранить" className="grid h-6 w-6 shrink-0 place-items-center rounded-full hover:bg-white/20">
+                        <Check className="h-3.5 w-3.5" />
+                      </button>
+                      <button onClick={cancelEdit} title="Отмена" className="grid h-6 w-6 shrink-0 place-items-center rounded-full hover:bg-white/20">
+                        <XIcon className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  ) : (
+                    <>
+                      {m.replyTo && (
+                        <button
+                          onClick={() => scrollToMessage(m.replyTo!.id)}
+                          title="Перейти к исходному сообщению"
+                          className={cn(
+                            "mb-1.5 block w-full rounded-lg border-l-2 px-2 py-1 text-left text-xs opacity-80 transition-opacity hover:opacity-100",
+                            mine
+                              ? "border-white/50 bg-black/10 dark:border-black/40 dark:bg-black/5"
+                              : "border-thread/60 bg-black/5 dark:bg-white/5"
+                          )}
+                        >
+                          <span className="block font-medium">
+                            {m.replyTo.who === "a" ? nameA : nameB}
+                          </span>
+                          <span className="line-clamp-2 break-words">{m.replyTo.text}</span>
+                        </button>
+                      )}
+                      <p className="whitespace-pre-wrap break-words">{m.text}</p>
+                      {(m.createdAt || m.edited) && (
+                        <p className={cn("mt-1 text-[10px] opacity-60", mine ? "text-right" : "text-left")}>
+                          {formatTime(m.createdAt)}
+                          {m.edited ? " · изменено" : ""}
+                        </p>
+                      )}
+                    </>
+                  )}
+                </div>
+                {mine && <Avatar name={myName} photo={myPhoto} size={22} />}
+              </motion.div>
+            );
+          })}
+        </AnimatePresence>
+      </div>
+
+      {replyingTo && (
+        <div
+          className={cn(
+            "flex items-center gap-2 border-t px-4 pt-3 text-xs",
+            overlay ? "border-white/10 text-white/70" : "border-line text-mist dark:border-line-dark"
+          )}
+        >
+          <ReplyIcon className="h-3 w-3 shrink-0" />
+          <span className="min-w-0 flex-1 truncate">
+            Ответ · <span className="font-medium">{replyingTo.who === "a" ? nameA : nameB}</span>:{" "}
+            {replyingTo.text}
+          </span>
+          <button
+            onClick={cancelReply}
+            aria-label="Отменить ответ"
+            className={cn(
+              "grid h-5 w-5 shrink-0 place-items-center rounded-full transition-colors",
+              overlay ? "hover:bg-white/10 hover:text-white" : "hover:bg-thread/10 hover:text-thread"
+            )}
+          >
+            <XIcon className="h-3 w-3" />
+          </button>
+        </div>
+      )}
+
+      <form
+        onSubmit={handleSend}
+        className={cn(
+          "flex items-center gap-2 border-t p-4 pb-[max(1rem,env(safe-area-inset-bottom))]",
+          overlay ? "border-white/10" : "border-line dark:border-line-dark",
+          replyingTo && "border-t-0 pt-2"
+        )}
+      >
+        <input
+          ref={inputRef}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder="Напишите сообщение…"
+          className={cn(
+            "w-full rounded-full border bg-transparent px-4 py-2.5 text-base outline-none transition-colors sm:text-sm",
+            overlay
+              ? "border-white/15 text-white placeholder:text-white/40 focus:border-white/40"
+              : "border-line focus:border-thread dark:border-line-dark"
+          )}
+        />
+        <button
+          type="submit"
+          disabled={!draft.trim() || sending}
+          aria-label="Отправить сообщение"
+          className="grid h-10 w-10 shrink-0 place-items-center rounded-full bg-thread text-void transition-opacity hover:opacity-90 disabled:opacity-40"
+        >
+          <Send className="h-4 w-4" />
+        </button>
+      </form>
+    </div>
+  );
+}
